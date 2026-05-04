@@ -1,7 +1,10 @@
 """
 Baseline classifiers for multi-label toxicity detection.
 
-Models: TF-IDF + Logistic Regression (OvR), TF-IDF + XGBoost (OvR)
+Models:
+  - TF-IDF (100K) + Logistic Regression (OvR)  → tfidf_lr.joblib
+  - TF-IDF (20K)  + Logistic Regression (OvR)  → tfidf_lr_20k.joblib
+  - TF-IDF (20K)  + XGBoost (OvR)              → tfidf_xgb.joblib
 Data:   data/processed/train_cleaned.parquet
 Output: models/, docs/figures/, W&B project 'safeguard-studio'
 """
@@ -57,6 +60,9 @@ TFIDF_PARAMS = dict(
     strip_accents="unicode",
     analyzer="word",
 )
+
+# LR can handle 100K features without OOM; XGBoost histogram buffers cannot
+TFIDF_PARAMS_LR_100K = {**TFIDF_PARAMS, "max_features": 100_000}
 
 LR_PARAMS = dict(
     C=1.0,
@@ -206,46 +212,59 @@ def main():
     results: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
-    # Model 1 — TF-IDF + Logistic Regression
+    # Model 1 — TF-IDF (100K) + Logistic Regression
     # ------------------------------------------------------------------
-    lr_pipeline = build_ovr_pipeline(LogisticRegression(**LR_PARAMS))
-    lr_config = {"model": "LogisticRegression", "tfidf": TFIDF_PARAMS, "lr": LR_PARAMS}
-    lr_metrics = fit_and_evaluate(
-        "TF-IDF + Logistic Regression", lr_pipeline, X_train, X_test, y_train, y_test, lr_config
+    lr100_pipeline = Pipeline([
+        ("tfidf", TfidfVectorizer(**TFIDF_PARAMS_LR_100K)),
+        ("clf", OneVsRestClassifier(LogisticRegression(**LR_PARAMS), n_jobs=-1)),
+    ])
+    lr100_config = {"model": "LogisticRegression", "tfidf": TFIDF_PARAMS_LR_100K, "lr": LR_PARAMS}
+    lr100_metrics = fit_and_evaluate(
+        "TF-IDF + LR (100K)", lr100_pipeline, X_train, X_test, y_train, y_test, lr100_config
     )
-    results["LR"] = lr_metrics
-    joblib.dump(lr_pipeline, MODELS_DIR / "tfidf_lr.joblib")
+    results["LR (100K)"] = lr100_metrics
+    joblib.dump(lr100_pipeline, MODELS_DIR / "tfidf_lr.joblib")
     print(f"  Saved model → {MODELS_DIR / 'tfidf_lr.joblib'}")
 
     # ------------------------------------------------------------------
-    # Model 2 — TF-IDF + XGBoost
-    # For XGBoost OvR we need to handle class_weight manually via scale_pos_weight.
-    # We set it per-label inside a custom wrapper below.
+    # Model 2 — TF-IDF (20K) + Logistic Regression
+    # ------------------------------------------------------------------
+    lr20_pipeline = build_ovr_pipeline(LogisticRegression(**LR_PARAMS))
+    lr20_config = {"model": "LogisticRegression", "tfidf": TFIDF_PARAMS, "lr": LR_PARAMS}
+    lr20_metrics = fit_and_evaluate(
+        "TF-IDF + LR (20K)", lr20_pipeline, X_train, X_test, y_train, y_test, lr20_config
+    )
+    results["LR (20K)"] = lr20_metrics
+    joblib.dump(lr20_pipeline, MODELS_DIR / "tfidf_lr_20k.joblib")
+    print(f"  Saved model → {MODELS_DIR / 'tfidf_lr_20k.joblib'}")
+
+    # ------------------------------------------------------------------
+    # Model 3 — TF-IDF (20K) + XGBoost
+    # scale_pos_weight set per-label inside BalancedXGBClassifier.
+    # OvR n_jobs=1: XGBoost already parallelises internally; running both causes OOM
     # ------------------------------------------------------------------
 
     class BalancedXGBClassifier(XGBClassifier):
-        """XGBClassifier that sets scale_pos_weight from training data on fit."""
         def fit(self, X, y, **kwargs):
             neg, pos = (y == 0).sum(), (y == 1).sum()
             self.set_params(scale_pos_weight=neg / max(pos, 1))
             return super().fit(X, y, **kwargs)
 
-    # OvR n_jobs=1: XGBoost already parallelises internally; running both causes OOM
     xgb_pipeline = build_ovr_pipeline(BalancedXGBClassifier(**XGB_PARAMS), ovr_n_jobs=1)
     xgb_config = {"model": "XGBoost", "tfidf": TFIDF_PARAMS, "xgb": XGB_PARAMS}
     xgb_metrics = fit_and_evaluate(
-        "TF-IDF + XGBoost", xgb_pipeline, X_train, X_test, y_train, y_test, xgb_config
+        "TF-IDF + XGBoost (20K)", xgb_pipeline, X_train, X_test, y_train, y_test, xgb_config
     )
-    results["XGB"] = xgb_metrics
+    results["XGB (20K)"] = xgb_metrics
     joblib.dump(xgb_pipeline, MODELS_DIR / "tfidf_xgb.joblib")
     print(f"  Saved model → {MODELS_DIR / 'tfidf_xgb.joblib'}")
 
     # ------------------------------------------------------------------
-    # Summary table
+    # 3-way summary table
     # ------------------------------------------------------------------
-    print(f"\n{'='*60}")
-    print("  SUMMARY COMPARISON")
-    print(f"{'='*60}")
+    print(f"\n{'='*72}")
+    print("  3-WAY COMPARISON (same 80/20 stratified split)")
+    print(f"{'='*72}")
 
     rows = []
     for model_key, metrics in results.items():
@@ -260,10 +279,9 @@ def main():
     summary_df = pd.DataFrame(rows).set_index("Model")
     print(summary_df.to_string())
 
-    # Log summary as a W&B table
     comparison_run = wandb.init(
         project=WANDB_PROJECT,
-        name="baseline_comparison",
+        name="baseline_comparison_3way",
         reinit=True,
     )
     comparison_run.log({"summary_table": wandb.Table(dataframe=summary_df.reset_index())})
