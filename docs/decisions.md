@@ -4,6 +4,25 @@
 
 931 rows in the Jigsaw train set had at least one sub-label (`severe_toxic`, `obscene`, `threat`, `insult`, or `identity_hate`) set to 1 while `toxic=0`. This is an annotation inconsistency — any comment carrying a sub-label is by definition toxic. `toxic` was set to 1 for all affected rows, raising the toxic rate from 9.58% to 10.17%. Corrected dataset saved to `data/processed/train_cleaned.parquet`.
 
+## 2026-05-04 — Phase 1.3: DistilBERT fine-tuning — pipeline validated, full training deferred
+
+`src/transformer_classifier.py` implements two-phase DistilBERT fine-tuning (distilbert-base-uncased, HuggingFace Trainer, BCEWithLogitsLoss + per-label pos_weight). Phase 1 validation run (5K training rows, 1 epoch) completed successfully on CPU:
+
+| Label | Precision | Recall | F1 | AUC-ROC |
+|---|---|---|---|---|
+| toxic | 0.740 | 0.803 | 0.770 | 0.970 |
+| severe_toxic | 0.136 | 0.961 | 0.238 | 0.984 |
+| obscene | 0.546 | 0.911 | 0.683 | 0.982 |
+| threat | 0.037 | 0.480 | 0.069 | 0.890 |
+| insult | 0.485 | 0.892 | 0.628 | 0.979 |
+| identity_hate | 0.094 | 0.722 | 0.166 | 0.953 |
+| **macro F1** | | | **0.426** | |
+| **macro AUC-ROC** | | | | **0.960** |
+
+Even with 4% of training data and 1 epoch, macro AUC-ROC (0.960) is already close to the LR (100K) baseline (0.980) — pretrained representations carry significant weight. Low F1 on minority classes is a threshold-calibration effect from high pos_weight (threat: 335×, identity_hate: 110×); full training is expected to resolve this.
+
+**Decision:** Full training (~3 epochs × 127K rows) requires GPU — estimated 28 hours on CPU vs ~35 min on T4. Deferred until GPU instance is available. Run `python src/transformer_classifier.py` on a GPU host; script auto-detects device and enables fp16 when CUDA is present.
+
 ## 2026-05-04 — Phase 1.2: Baseline classifier results (TF-IDF + LR vs XGBoost)
 
 Three TF-IDF + OvR baselines trained on `train_cleaned.parquet` (80/20 stratified split on `toxic`, n=159,571). Class imbalance handled via `class_weight="balanced"` for LR and per-label `scale_pos_weight` for XGBoost.
